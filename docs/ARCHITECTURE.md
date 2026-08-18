@@ -45,7 +45,7 @@ OpenMontage/
 │   ├── tool_registry.py    # Auto-discovery singleton registry
 │   ├── cost_tracker.py     # Budget governance (estimate → reserve → reconcile)
 │   ├── analysis/           # Transcription, scene detection, frame sampling, video understanding
-│   ├── audio/              # TTS (ElevenLabs, OpenAI, Piper), music gen, mixing, enhancement
+│   ├── audio/              # TTS (ElevenLabs, OpenAI, Piper, Azure, Google), music gen, mixing, enhancement
 │   ├── avatar/             # Talking head animation, lip sync
 │   ├── enhancement/        # Upscale, bg removal, face enhance/restore, color grading
 │   ├── graphics/           # Image gen (FLUX, GPT Image, Recraft, local diffusion), stock, diagrams, code snippets, math animation
@@ -145,14 +145,15 @@ Three selector tools abstract multi-provider capabilities:
 | `tts_selector` | Text-to-speech | Ranks discovered providers by task fit, quality, control, reliability, cost, latency, and continuity |
 | `image_selector` | Image generation | Ranks discovered providers from the live registry; no hardcoded provider order |
 | `video_selector` | Video generation | Ranks discovered providers from the live registry; user preference is respected when explicitly provided |
+| `atlas_image` / `atlas_video` | Atlas Cloud generation | Exposes exact per-model route catalogs for image generation/editing and text/image/reference/video-edit generation |
 
 Selectors route based on: user preference when explicitly set, then scored ranking across available providers. They adapt input schemas between providers transparently.
 
 ### Tool Inventory by Category
 
-**Analysis (4):** transcriber (WhisperX), scene_detect, frame_sampler, video_understand (CLIP/BLIP-2)
+**Analysis (5):** transcriber (WhisperX), azure_stt, scene_detect, frame_sampler, video_understand (CLIP/BLIP-2)
 
-**Audio (8):** elevenlabs_tts, google_tts, openai_tts, piper_tts, tts_selector, music_gen, audio_mixer, audio_enhance
+**Audio (9):** elevenlabs_tts, google_tts, openai_tts, piper_tts, azure_tts, tts_selector, music_gen, audio_mixer, audio_enhance
 
 **Avatar (2):** talking_head (SadTalker/MuseTalk), lip_sync (Wav2Lip)
 
@@ -383,9 +384,12 @@ All config is validated via Pydantic models in `lib/config_model.py`.
 | Variable | Used By | Purpose |
 |----------|---------|---------|
 | `ELEVENLABS_API_KEY` | elevenlabs_tts, music_gen | TTS, music, sound effects |
+| `AZURE_SPEECH_KEY` + `AZURE_SPEECH_REGION` | azure_stt, azure_tts | Azure AI Speech cloud transcription + neural TTS (one resource, both directions) |
 | `OPENAI_API_KEY` | openai_tts, openai_image | TTS fallback, GPT Image 2 |
 | `XAI_API_KEY` | grok_image, grok_video | Grok image editing/generation, Grok video generation |
 | `FAL_KEY` | flux_image, kling_video, veo_video, minimax_video, recraft_image | fal.ai hosted models (FLUX, Veo, Kling, MiniMax, Recraft) |
+| `KLING_API_KEY` | kling_official_video, kling_official_image, kling_tts, kling_avatar, kling_lip_sync | Official Kling direct API for video, image, TTS, avatar, and lip sync |
+| `KLING_API_BASE_URL` | kling_official_video, kling_official_image, kling_tts, kling_avatar, kling_lip_sync | Optional official Kling API endpoint override |
 | `HEYGEN_API_KEY` | heygen_video | Multi-provider video generation |
 | `PEXELS_API_KEY` | pexels_image, pexels_video | Stock media |
 | `PIXABAY_API_KEY` | pixabay_image, pixabay_video | Stock media |
@@ -395,6 +399,18 @@ All config is validated via Pydantic models in `lib/config_model.py`.
 | `MODAL_LTX2_ENDPOINT_URL` | ltx_video_modal | Self-hosted LTX-2 |
 | `VIDEO_GEN_LOCAL_ENABLED` | local video tools | Enable local GPU generation |
 | `VIDEO_GEN_LOCAL_MODEL` | wan, hunyuan, ltx, cogvideo | Select local model |
+
+Kling Official support stays inside the existing provider and capability model.
+`kling_official_video` and `kling_official_image` handle Classic, Turbo, and Omni
+request shapes, while Elements and Account Usage live under `tools/_kling/` as
+internal helpers for element ID references and low-frequency account diagnostics;
+they are not separate pipeline stages, selectors, or generated-asset capabilities.
+
+Kling Official also adds provider tools only where OpenMontage already has a
+matching capability slot: `kling_tts` for `tts`, plus `kling_avatar` and
+`kling_lip_sync` for `avatar`. Official Kling audio effects and video effects are
+not registered as tools because current pipelines do not define stable
+`sound_effects` or `video_effects` capability routing.
 
 ---
 

@@ -10,11 +10,12 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from backlot.state import PROJECTS_DIR, REPO_ROOT, list_projects, load_board_state, summarize_project
@@ -27,6 +28,16 @@ THUMB_WIDTHS = (320, 640, 960)
 _IGNORE_PARTS = {"node_modules", ".git", "__pycache__", ".cache"}
 
 SSE_HEARTBEAT_SECONDS = 15
+
+
+def _ui_html(name: str, assets: tuple[str, ...]) -> HTMLResponse:
+    html = (UI_DIR / name).read_text(encoding="utf-8")
+    for asset in assets:
+        path = UI_DIR / asset
+        if path.is_file():
+            version = str(int(path.stat().st_mtime))
+            html = html.replace(f"/ui/{asset}", f"/ui/{asset}?v={version}")
+    return HTMLResponse(html)
 
 
 class ChangeHub:
@@ -137,18 +148,22 @@ async def _watch_projects() -> None:
             hub.publish(pid)
 
 
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    """Own and cleanly stop the project watcher with FastAPI's lifespan API."""
+
+    task = asyncio.create_task(_watch_projects())
+    app.state.watch_task = task
+    try:
+        yield
+    finally:
+        task.cancel()
+        with suppress(asyncio.CancelledError):
+            await task
+
+
 def create_app() -> FastAPI:
-    app = FastAPI(title="Backlot", docs_url=None, redoc_url=None)
-
-    @app.on_event("startup")
-    async def _startup() -> None:
-        app.state.watch_task = asyncio.create_task(_watch_projects())
-
-    @app.on_event("shutdown")
-    async def _shutdown() -> None:
-        task = getattr(app.state, "watch_task", None)
-        if task:
-            task.cancel()
+    app = FastAPI(title="Backlot", docs_url=None, redoc_url=None, lifespan=_lifespan)
 
     # ---- API ----------------------------------------------------------
 
@@ -263,19 +278,31 @@ def create_app() -> FastAPI:
     # ---- UI ------------------------------------------------------------
 
     @app.get("/p/{project_id}")
-    async def board_page(project_id: str) -> FileResponse:
-        return FileResponse(UI_DIR / "board.html")
+    async def board_page(project_id: str) -> HTMLResponse:
+        return _ui_html("board.html", ("board.css", "board.js"))
 
     @app.get("/p/{project_path:path}")
-    async def board_page_path(project_path: str) -> FileResponse:
-        return FileResponse(UI_DIR / "board.html")
+    async def board_page_path(project_path: str) -> HTMLResponse:
+        return _ui_html("board.html", ("board.css", "board.js"))
 
     @app.get("/")
-    async def library_page() -> FileResponse:
-        return FileResponse(UI_DIR / "index.html")
+    async def library_page() -> HTMLResponse:
+        return _ui_html("index.html", ("board.css", "library.js"))
 
     if UI_DIR.is_dir():
         app.mount("/ui", StaticFiles(directory=UI_DIR), name="ui")
+
+    # The board is a long-lived SPA: a tab keeps running whatever board.js it
+    # loaded, and browsers heuristically cache /ui assets. no-cache forces a
+    # conditional revalidation (cheap 304 via ETag) on every load so UI fixes
+    # show up on a plain refresh. Media/thumb responses keep normal caching.
+    @app.middleware("http")
+    async def ui_no_cache(request, call_next):
+        response = await call_next(request)
+        path = request.url.path
+        if path == "/" or path.startswith("/ui") or path.startswith("/p/"):
+            response.headers["Cache-Control"] = "no-cache"
+        return response
 
     return app
 

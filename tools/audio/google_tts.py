@@ -24,7 +24,10 @@ from tools.base_tool import (
     ToolStatus,
     ToolTier,
 )
-from tools.google_credentials import get_access_token, service_account_configured
+from tools.google_credentials import (
+    get_access_token,
+    service_account_configured,
+)
 
 
 class GoogleTTS(BaseTool):
@@ -40,7 +43,8 @@ class GoogleTTS(BaseTool):
 
     dependencies = []
     install_instructions = (
-        "Auth option A — API key: set GOOGLE_API_KEY (or GEMINI_API_KEY) to a\n"
+        "Auth option A — TTS-only API key: set GOOGLE_TTS_API_KEY.\n"
+        "  GOOGLE_API_KEY or GEMINI_API_KEY remain supported for broader Google setups.\n"
         "  Google Cloud API key with Text-to-Speech enabled.\n"
         "  Enable the API at https://console.cloud.google.com/apis/library/texttospeech.googleapis.com\n"
         "Auth option B — service account: set GOOGLE_APPLICATION_CREDENTIALS to the\n"
@@ -121,8 +125,17 @@ class GoogleTTS(BaseTool):
     resource_profile = ResourceProfile(
         cpu_cores=1, ram_mb=256, vram_mb=0, disk_mb=50, network_required=True
     )
-    retry_policy = RetryPolicy(max_retries=2, retryable_errors=["rate_limit", "timeout"])
-    idempotency_key_fields = ["text", "input_type", "voice", "language_code", "speaking_rate", "pitch"]
+    retry_policy = RetryPolicy(
+        max_retries=2, retryable_errors=["rate_limit", "timeout"]
+    )
+    idempotency_key_fields = [
+        "text",
+        "input_type",
+        "voice",
+        "language_code",
+        "speaking_rate",
+        "pitch",
+    ]
     side_effects = ["writes audio file to output_path", "calls Google Cloud TTS API"]
     user_visible_verification = ["Listen to generated audio for natural speech quality"]
 
@@ -136,7 +149,11 @@ class GoogleTTS(BaseTool):
     }
 
     def _get_api_key(self) -> str | None:
-        return os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
+        return (
+            os.environ.get("GOOGLE_TTS_API_KEY")
+            or os.environ.get("GOOGLE_API_KEY")
+            or os.environ.get("GEMINI_API_KEY")
+        )
 
     def get_status(self) -> ToolStatus:
         # Available via either an API key or a service-account JSON. Both paths
@@ -191,7 +208,11 @@ class GoogleTTS(BaseTool):
         try:
             result = self._generate(inputs, api_key=api_key, bearer_token=bearer_token)
         except Exception as exc:
-            return ToolResult(success=False, error=f"Google TTS failed: {exc}")
+            safe_error = str(exc)
+            for credential in (api_key, bearer_token):
+                if credential:
+                    safe_error = safe_error.replace(credential, "[REDACTED]")
+            return ToolResult(success=False, error=f"Google TTS failed: {safe_error}")
 
         result.duration_seconds = round(time.time() - start, 2)
         result.cost_usd = self.estimate_cost(inputs)
@@ -226,7 +247,11 @@ class GoogleTTS(BaseTool):
 
         if input_type == "ssml":
             stripped = text.strip()
-            ssml = stripped if stripped.startswith("<speak") else f"<speak>{stripped}</speak>"
+            ssml = (
+                stripped
+                if stripped.startswith("<speak")
+                else f"<speak>{stripped}</speak>"
+            )
             synthesis_input = {"ssml": ssml}
         else:
             synthesis_input = {"text": text}
@@ -249,16 +274,14 @@ class GoogleTTS(BaseTool):
         url = f"https://texttospeech.googleapis.com/{api_version}/text:synthesize"
 
         headers = {"Content-Type": "application/json"}
-        params: dict[str, str] = {}
         if bearer_token:
             headers["Authorization"] = f"Bearer {bearer_token}"
-        else:
-            params["key"] = api_key
+        elif api_key:
+            headers["x-goog-api-key"] = api_key
 
         response = requests.post(
             url,
             headers=headers,
-            params=params,
             json=payload,
             timeout=120,
         )

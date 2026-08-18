@@ -20,7 +20,7 @@ class ImageSelector(BaseTool):
     provider = "selector"
     stability = ToolStability.BETA
     runtime = ToolRuntime.HYBRID
-    agent_skills = ["flux-best-practices", "bfl-api"]
+    agent_skills = ["flux-best-practices", "bfl-api", "atlas-cloud"]
 
     capabilities = [
         "generate_image", "search_image", "download_image",
@@ -61,6 +61,18 @@ class ImageSelector(BaseTool):
                 "type": "string",
                 "description": "Resolution tier for providers that support named resolutions.",
             },
+            "api_family": {
+                "type": "string",
+                "description": "Provider-specific API family hint passed through when supported.",
+            },
+            "model_name": {
+                "type": "string",
+                "description": "Provider-specific model name passed through when supported.",
+            },
+            "model": {
+                "type": "string",
+                "description": "Exact provider model id, e.g. an Atlas Cloud live model route.",
+            },
             "generation_mode": {
                 "type": "string",
                 "enum": ["generate", "edit"],
@@ -78,6 +90,46 @@ class ImageSelector(BaseTool):
                 "type": "array",
                 "items": {"type": "string"},
                 "description": "Multiple local source image paths for compositing edits.",
+            },
+            "image_list": {
+                "type": "array",
+                "description": "Provider-specific image reference list, e.g. Kling Official Image Omni.",
+            },
+            "element_list": {
+                "type": "array",
+                "description": "Provider-specific element references, e.g. Kling Official element_id objects.",
+            },
+            "image_reference": {
+                "type": "string",
+                "description": "Provider-specific reference type, e.g. subject or face.",
+            },
+            "image_fidelity": {
+                "type": "number",
+                "description": "Provider-specific reference image fidelity hint.",
+            },
+            "human_fidelity": {
+                "type": "number",
+                "description": "Provider-specific human or face fidelity hint.",
+            },
+            "result_type": {
+                "type": "string",
+                "description": "Provider-specific result type, e.g. single or series.",
+            },
+            "series_amount": {
+                "type": "string",
+                "description": "Provider-specific series amount for image series generation.",
+            },
+            "watermark": {
+                "type": "boolean",
+                "description": "Provider-specific watermark toggle passed through when supported.",
+            },
+            "callback_url": {
+                "type": "string",
+                "description": "Provider-specific callback URL. Current OpenMontage providers still poll by default.",
+            },
+            "external_task_id": {
+                "type": "string",
+                "description": "Provider-specific idempotency/provenance task id.",
             },
             "preferred_provider": {
                 "type": "string",
@@ -194,6 +246,27 @@ class ImageSelector(BaseTool):
             props = tool.input_schema.get("properties", {})
             if "query" in props and "query" not in adapted:
                 adapted["query"] = adapted.get("prompt", "")
+            # Normalize the selector's shared reference-image inputs for
+            # providers whose native contract accepts an ``images`` array.
+            if "images" in props and "images" not in adapted:
+                refs = (
+                    adapted.get("image_paths")
+                    or adapted.get("image_urls")
+                    or ([adapted["image_path"]] if adapted.get("image_path") else None)
+                    or ([adapted["image_url"]] if adapted.get("image_url") else None)
+                )
+                if refs:
+                    adapted["images"] = refs
+            # The selector exposes a provider-neutral ``model_name`` field,
+            # while several providers call the same input ``model``.
+            if (
+                "model_name" in adapted
+                and "model" in props
+                and "model" not in adapted
+            ):
+                adapted["model"] = adapted["model_name"]
+            if "n" in adapted and "num_images" in props and "num_images" not in adapted:
+                adapted["num_images"] = adapted["n"]
 
         # Strip selector-only keys that downstream tools don't understand
         adapted.pop("preferred_provider", None)
@@ -216,6 +289,19 @@ class ImageSelector(BaseTool):
                 "image_path",
                 "image_urls",
                 "image_paths",
+                "image_list",
+                "element_list",
+                "api_family",
+                "model_name",
+                "model",
+                "image_reference",
+                "image_fidelity",
+                "human_fidelity",
+                "result_type",
+                "series_amount",
+                "watermark",
+                "callback_url",
+                "external_task_id",
                 "workflow_json",
                 "workflow_path",
                 "output_node",
@@ -315,6 +401,16 @@ class ImageSelector(BaseTool):
         return serialized
 
     def _filter_candidates(self, inputs: dict[str, Any], candidates: list[BaseTool]) -> list[BaseTool]:
+        exact_model = inputs.get("model")
+        if exact_model:
+            model_matches = [
+                tool for tool in candidates
+                if exact_model in getattr(tool, "input_schema", {}).get("properties", {}).get("model", {}).get("enum", [])
+                or exact_model in tool.get_info().get("model_catalog", {})
+            ]
+            if model_matches:
+                candidates = model_matches
+
         # A caller-supplied custom workflow is provider-specific (ComfyUI graph
         # JSON). Route it only to custom-workflow-capable providers whose server
         # is reachable — bundled-model readiness is irrelevant in that case.

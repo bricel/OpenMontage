@@ -5,11 +5,11 @@ import {
   useCurrentFrame,
   useVideoConfig,
 } from "remotion";
+import { resolveAsset } from "../lib/resolveAsset";
 import {
   containRect,
   CursorArrow,
   OverlayForStep,
-  resolveAsset,
   type Point,
   type ScreenshotStep,
   type TimedStep,

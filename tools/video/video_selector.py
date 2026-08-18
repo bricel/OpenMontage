@@ -20,16 +20,16 @@ class VideoSelector(BaseTool):
     provider = "selector"
     stability = ToolStability.BETA
     runtime = ToolRuntime.HYBRID
-    agent_skills = ["ai-video-gen", "create-video", "ltx2"]
+    agent_skills = ["ai-video-gen", "create-video", "ltx2", "gemini-omni", "atlas-cloud"]
 
     # Operations that REQUIRE motion: an image-only tool (image_selector) is not
     # an acceptable last-resort fallback for these, so fallback_tools_for() drops it.
-    MOTION_REQUIRED_OPERATIONS = frozenset({"image_to_video", "reference_to_video"})
+    MOTION_REQUIRED_OPERATIONS = frozenset({"image_to_video", "reference_to_video", "video_edit"})
     # Default score gap for the preferred_provider override (see input_schema).
     PREFERRED_PROVIDER_GAP = 0.15
 
     capabilities = [
-        "text_to_video", "image_to_video", "stock_video",
+        "text_to_video", "image_to_video", "reference_to_video", "video_edit", "stock_video",
         "provider_selection", "search_video", "download_video",
     ]
     supports = {
@@ -70,12 +70,12 @@ class VideoSelector(BaseTool):
             "allowed_providers": {"type": "array", "items": {"type": "string"}},
             "operation": {
                 "type": "string",
-                "enum": ["text_to_video", "image_to_video", "reference_to_video", "rank"],
+                "enum": ["text_to_video", "image_to_video", "reference_to_video", "video_edit", "rank"],
                 "default": "text_to_video",
             },
             "target_operation": {
                 "type": "string",
-                "enum": ["text_to_video", "image_to_video", "reference_to_video"],
+                "enum": ["text_to_video", "image_to_video", "reference_to_video", "video_edit"],
                 "description": "Operation to score when operation='rank'.",
                 "default": "text_to_video",
             },
@@ -107,6 +107,64 @@ class VideoSelector(BaseTool):
                 "items": {"type": "string"},
                 "description": "Local reference image paths for providers that support reference-conditioned video.",
             },
+            "reference_video_url": {
+                "type": "string",
+                "description": "Reference video URL for providers that support video-conditioned generation.",
+            },
+            "reference_video_path": {
+                "type": "string",
+                "description": "Local reference video path. Providers that require URLs should reject this clearly.",
+            },
+            "reference_video_urls": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Reference video URLs for mixed-media generation.",
+            },
+            "reference_video_paths": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Local reference video paths for mixed-media generation.",
+            },
+            "reference_audio_urls": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Reference audio URLs for mixed-media generation.",
+            },
+            "reference_audio_paths": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Local reference audio paths for mixed-media generation.",
+            },
+            "last_image_url": {"type": "string", "description": "Optional final frame for first/last-frame generation."},
+            "last_image_path": {"type": "string", "description": "Optional local final frame."},
+            "video_url": {"type": "string", "description": "Source video URL for video editing."},
+            "video_path": {"type": "string", "description": "Local source video for video editing."},
+            "video_clips": {"type": "array", "items": {"type": "object"}},
+            "refers": {"type": "array", "items": {"type": "object"}},
+            "image_list": {
+                "type": "array",
+                "description": "Provider-specific list of image references, e.g. Kling Official Video Omni.",
+            },
+            "video_list": {
+                "type": "array",
+                "description": "Provider-specific list of video references, e.g. Kling Official Video Omni.",
+            },
+            "element_list": {
+                "type": "array",
+                "description": "Provider-specific element references, e.g. Kling Official element_id objects.",
+            },
+            "multi_shot": {
+                "type": "boolean",
+                "description": "Provider-specific multi-shot mode.",
+            },
+            "shot_type": {
+                "type": "string",
+                "description": "Provider-specific multi-shot type.",
+            },
+            "multi_prompt": {
+                "type": "array",
+                "description": "Structured multi-shot prompts; not inferred from prose.",
+            },
             "image_url": {
                 "type": "string",
                 "description": "Alias for reference_image_url (used by some providers like Kling via fal.ai).",
@@ -114,6 +172,42 @@ class VideoSelector(BaseTool):
             "resolution": {
                 "type": "string",
                 "description": "Resolution hint for providers that support named output resolutions.",
+            },
+            "api_family": {
+                "type": "string",
+                "description": "Provider-specific API family hint passed through when supported, e.g. classic/turbo/omni.",
+            },
+            "model_name": {
+                "type": "string",
+                "description": "Provider-specific model name passed through when supported.",
+            },
+            "model": {
+                "type": "string",
+                "description": "Exact provider model id, e.g. an Atlas Cloud live model route.",
+            },
+            "model_variant": {
+                "type": "string",
+                "description": "Provider route variant, e.g. standard or developer.",
+            },
+            "mode": {
+                "type": "string",
+                "description": "Provider-specific quality mode passed through when supported.",
+            },
+            "sound": {
+                "type": "string",
+                "description": "Provider-specific native audio toggle passed through when supported.",
+            },
+            "watermark": {
+                "type": "boolean",
+                "description": "Provider-specific watermark toggle passed through when supported.",
+            },
+            "callback_url": {
+                "type": "string",
+                "description": "Provider-specific callback URL. Current OpenMontage providers still poll by default.",
+            },
+            "external_task_id": {
+                "type": "string",
+                "description": "Provider-specific idempotency/provenance task id.",
             },
             "workflow_json": {
                 "type": "string",
@@ -389,6 +483,16 @@ class VideoSelector(BaseTool):
         inputs: dict[str, object],
         candidates: list[BaseTool],
     ) -> list[BaseTool]:
+        exact_model = inputs.get("model")
+        if exact_model:
+            model_matches = [
+                tool for tool in candidates
+                if exact_model in getattr(tool, "input_schema", {}).get("properties", {}).get("model", {}).get("enum", [])
+                or exact_model in tool.get_info().get("model_catalog", {})
+            ]
+            if model_matches:
+                candidates = model_matches
+
         # A caller-supplied custom workflow is provider-specific (ComfyUI graph
         # JSON). Route it only to custom-workflow-capable providers whose server
         # is reachable — bundled-model readiness is irrelevant in that case.
