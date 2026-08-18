@@ -72,8 +72,18 @@ def run_tutorial_spec(
     ]
     if config_pairs:
         cmd += ["--config", ",".join(config_pairs)]
+
+    # CLI --env beats cypress.env.json. Forward CYPRESS_* / bare TEST_* so a
+    # stale committed TEST_SALE_ID cannot silently send us to a missing node.
+    env_pairs: list[str] = []
     if collect_only:
-        cmd += ["--env", "tutorialCollectOnly=1"]
+        env_pairs.append("tutorialCollectOnly=1")
+    for key in ("TEST_SALE_ID", "TEST_ITEM_ID", "TEST_CLIENT_ID", "TEST_UID"):
+        val = os.environ.get(f"CYPRESS_{key}") or os.environ.get(key)
+        if val:
+            env_pairs.append(f"{key}={val}")
+    if env_pairs:
+        cmd += ["--env", ",".join(env_pairs)]
 
     env = os.environ.copy()
     env["CYPRESS_NO_COMMAND_LOG"] = "1"
