@@ -16,8 +16,11 @@ data:
   # or "ffmpeg" (self-contained assembly). remotion requires the worker image built
   # with --build-arg INSTALL_REMOTION=true (the default).
   RENDER_RUNTIME: "remotion"
+  WORKER_SERVICE_ACCOUNT: "render-worker"
   MAX_CONCURRENT: "2"
-  JOB_TTL_SECONDS: "3600"
+  PRESIGN_HOURS: "24"
+  # TTL outlives the presigned URL so a reaped Job doesn't 404 a still-downloadable render.
+  JOB_TTL_SECONDS: "90000"
   JOB_DEADLINE_SECONDS: "1800"
   WORKER_MEM_REQUEST: "4Gi"
   WORKER_MEM_LIMIT: "8Gi"

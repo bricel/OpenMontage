@@ -94,13 +94,19 @@ export const ScreencastScene: React.FC<ScreencastSceneProps> = ({
   for (const z of zoom) {
     if (t >= z.atSeconds && t <= z.untilSeconds) {
       const a = z.atSeconds * fps;
-      const b = z.untilSeconds * fps;
-      const ramp = Math.min(0.5 * fps, (b - a) / 2);
+      const b = Math.max(z.untilSeconds * fps, a + 2); // >= 2 frames keeps ranges valid
       const target = z.scale ?? 1.6;
-      zScale = interpolate(frame, [a, a + ramp, b - ramp, b], [1, target, target, 1], {
-        extrapolateLeft: "clamp",
-        extrapolateRight: "clamp",
-      });
+      const ramp = Math.max(1, Math.min(0.5 * fps, (b - a) / 2));
+      // interpolate() requires a STRICTLY increasing input range. For short zoom
+      // windows a+ramp === b-ramp, which throws — so short windows use a single
+      // triangle peak (ramp in, ramp out) instead of an in/hold/out.
+      const hold = a + ramp < b - ramp;
+      zScale = interpolate(
+        frame,
+        hold ? [a, a + ramp, b - ramp, b] : [a, (a + b) / 2, b],
+        hold ? [1, target, target, 1] : [1, target, 1],
+        { extrapolateLeft: "clamp", extrapolateRight: "clamp" }
+      );
       const c = absRect(z.region);
       zx = c.left + c.width / 2;
       zy = c.top + c.height / 2;
@@ -109,31 +115,37 @@ export const ScreencastScene: React.FC<ScreencastSceneProps> = ({
   }
 
   // --- Cursor position (ease between waypoints by wall-clock time) ---
-  let cursorPos: Point = cursorStartAt;
-  if (cursor.length > 0) {
-    if (t <= cursor[0].atSeconds) {
-      cursorPos = cursor[0].to;
-    } else if (t >= cursor[cursor.length - 1].atSeconds) {
-      cursorPos = cursor[cursor.length - 1].to;
-    } else {
-      for (let i = 0; i < cursor.length - 1; i++) {
-        const c0 = cursor[i];
-        const c1 = cursor[i + 1];
-        if (t >= c0.atSeconds && t <= c1.atSeconds) {
-          const p = interpolate(t, [c0.atSeconds, c1.atSeconds], [0, 1], {
-            extrapolateLeft: "clamp",
-            extrapolateRight: "clamp",
-          });
-          const eased = 1 - Math.pow(1 - p, 3);
-          cursorPos = [
-            c0.to[0] + (c1.to[0] - c0.to[0]) * eased,
-            c0.to[1] + (c1.to[1] - c0.to[1]) * eased,
-          ];
-          break;
-        }
+  // Prepend an implicit waypoint at t=0 at cursorStartAt so the cursor rests at
+  // its start position and eases INTO the first target, rather than being pinned
+  // to the first target for the whole preroll.
+  const kf: CursorKeyframe[] =
+    cursor.length === 0
+      ? [{ atSeconds: 0, to: cursorStartAt }]
+      : cursor[0].atSeconds > 0
+        ? [{ atSeconds: 0, to: cursorStartAt }, ...cursor]
+        : cursor;
+  const cursorAt = (tt: number): Point => {
+    if (tt <= kf[0].atSeconds) return kf[0].to;
+    if (tt >= kf[kf.length - 1].atSeconds) return kf[kf.length - 1].to;
+    for (let i = 0; i < kf.length - 1; i++) {
+      const c0 = kf[i];
+      const c1 = kf[i + 1];
+      if (c1.atSeconds <= c0.atSeconds) continue; // skip duplicate/degenerate stamps
+      if (tt >= c0.atSeconds && tt <= c1.atSeconds) {
+        const p = interpolate(tt, [c0.atSeconds, c1.atSeconds], [0, 1], {
+          extrapolateLeft: "clamp",
+          extrapolateRight: "clamp",
+        });
+        const eased = 1 - Math.pow(1 - p, 3);
+        return [
+          c0.to[0] + (c1.to[0] - c0.to[0]) * eased,
+          c0.to[1] + (c1.to[1] - c0.to[1]) * eased,
+        ];
       }
     }
-  }
+    return kf[kf.length - 1].to;
+  };
+  const cursorPos = cursorAt(t);
   const cursorAbs = abs(cursorPos);
 
   return (
@@ -160,17 +172,19 @@ export const ScreencastScene: React.FC<ScreencastSceneProps> = ({
         {overlays.map((o, i) => {
           const startFrame = Math.round(o.atSeconds * fps);
           const endFrame = Math.round(o.untilSeconds * fps);
-          const sticky = o.kind === "type_into" || o.kind === "bubble_append";
-          const active = sticky
-            ? frame >= startFrame
-            : frame >= startFrame && frame <= endFrame + fps * 0.4;
-          if (!active) return null;
+          // Over a MOVING capture every overlay respects its [at, until] window
+          // (no sticky-forever like the static ScreenshotScene) — otherwise a
+          // type_into/bubble_append stays glued on after the app navigates away.
+          if (frame < startFrame || frame > endFrame + fps * 0.4) return null;
+          // Freeze a click_pulse's implicit anchor to the cursor position at the
+          // pulse's start, so it doesn't smear along the live moving cursor.
+          const anchor = cursorAt(o.atSeconds);
           const timed: TimedStep = {
             step: o,
             startFrame,
             endFrame,
-            cursorBefore: cursorPos,
-            cursorAfter: cursorPos,
+            cursorBefore: anchor,
+            cursorAfter: anchor,
           };
           return (
             <OverlayForStep

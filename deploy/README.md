@@ -32,8 +32,15 @@ docker push <registry>/circuit-ttsd:latest
 ```
 
 Put a `.dockerignore` in `context/` excluding `**/node_modules`, `**/projects`,
-`**/.git`, `**/cypress/videos` to keep the build fast (the image installs its own
+`**/cypress/videos` to keep the build fast (the image installs its own
 `node_modules`).
+
+**Per-request `ref`:** to support rendering a specific client git ref, the baked
+`client/` must be a **real git checkout** (keep its `.git`) — a plain
+`COPY client/` of a subdirectory has none, so the worker logs "no .git — using
+baked specs" and renders the baked version. Either keep `.git` in the context, or
+have the worker `git clone` at build time. Without it, every render uses the
+image's baked specs regardless of `ref`.
 
 ## Deploy (k3s)
 

@@ -56,6 +56,12 @@ def resolve_tutorial(client_dir: Path, name: str) -> dict:
     recipe_path = spec.with_name(f"{name}.tutorial.json")
     timings_path = spec.with_name(f"{name}.timings.json")
     recipe = json.loads(recipe_path.read_text()) if recipe_path.exists() else {}
+    if not recipe_path.exists():
+        print(f"WARN: no recipe {recipe_path.name} — using defaults (title from name).", file=sys.stderr)
+    # Never let intro/outro cards render an empty string (Explainer would fall back
+    # to the literal cut id, e.g. "intro"). Default the title from the tutorial name.
+    if not recipe.get("title"):
+        recipe["title"] = name.replace("-", " ").replace("_", " ").title()
     timings = json.loads(timings_path.read_text()) if timings_path.exists() else {}
     spec_rel = spec.relative_to(client_dir).as_posix()
     return {
@@ -69,8 +75,8 @@ def resolve_tutorial(client_dir: Path, name: str) -> dict:
 
 # --- ffmpeg helpers ---------------------------------------------------------
 
-def _run(cmd: list[str]) -> None:
-    subprocess.run(cmd, check=True)
+def _run(cmd: list[str], cwd: Optional[str] = None) -> None:
+    subprocess.run(cmd, check=True, cwd=cwd)
 
 
 def silent_wav(duration_s: float, out: Path, ar: int = AR) -> Path:
@@ -106,7 +112,7 @@ def narration_bed(clips: list[tuple[float, Path]], total_s: float, out: Path, ar
     return out
 
 
-def loop_music(music: Path, duration_s: float, out: Path, base_vol: float = 0.22, ar: int = AR) -> Path:
+def loop_music(music: Path, duration_s: float, out: Path, base_vol: float = T.MUSIC_VOLUME, ar: int = AR) -> Path:
     out.parent.mkdir(parents=True, exist_ok=True)
     fade_out_start = max(0.0, duration_s - 1.5)
     af = f"volume={base_vol},afade=t=in:st=0:d=1.0,afade=t=out:st={fade_out_start:.3f}:d=1.5"
@@ -120,7 +126,10 @@ def loop_music(music: Path, duration_s: float, out: Path, base_vol: float = 0.22
 
 
 def duck_music(narration: Path, music_bed: Path, out: Path) -> Path:
-    """Reuse audio_mixer to duck music under narration; fall back to ffmpeg."""
+    """Duck music under narration via audio_mixer; fall back to ffmpeg sidechain.
+    The fallback is LOGGED (never silent) so a swallowed import can't quietly
+    change how the mix sounds; its attack/release (200/500ms) match audio_mixer's
+    ducking defaults."""
     try:
         from tools.audio.audio_mixer import AudioMixer
 
@@ -133,9 +142,10 @@ def duck_music(narration: Path, music_bed: Path, out: Path) -> Path:
         })
         if getattr(res, "success", False) and out.exists():
             return out
-    except Exception:
-        pass
-    # ffmpeg sidechain fallback
+        print(f"WARN audio_mixer duck did not succeed ({getattr(res, 'error', '?')}); "
+              "using ffmpeg sidechain fallback", file=sys.stderr)
+    except Exception as e:  # noqa: BLE001
+        print(f"WARN audio_mixer unavailable ({e}); using ffmpeg sidechain fallback", file=sys.stderr)
     _run([
         "ffmpeg", "-y", "-v", "error",
         "-i", str(narration), "-i", str(music_bed),
@@ -174,9 +184,13 @@ def burn_and_mux(video: Path, audio: Path, srt: Optional[Path], out: Path,
                  target: tuple[int, int], recipe: dict) -> Path:
     tw, th = target
     vf = f"scale={tw}:{th},setsar=1,format=yuv420p"
+    cwd = None
     if srt and srt.exists():
-        srt_esc = str(srt).replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
-        vf += f",subtitles='{srt_esc}':force_style='{_srt_style(recipe)}'"
+        # Reference the SRT by basename from its own dir so the filtergraph never
+        # embeds a path with special chars (':', apostrophes) that break ffmpeg's
+        # lavfi quoting. Input/output stay absolute (passed as argv, not in-filter).
+        cwd = str(srt.parent)
+        vf += f",subtitles={srt.name}:force_style='{_srt_style(recipe)}'"
     _run([
         "ffmpeg", "-y", "-v", "error",
         "-i", str(video), "-i", str(audio),
@@ -185,7 +199,7 @@ def burn_and_mux(video: Path, audio: Path, srt: Optional[Path], out: Path,
         "-c:v", "libx264", "-crf", "20", "-preset", "medium",
         "-c:a", "aac", "-ar", str(AR), "-ac", "2",
         "-shortest", str(out),
-    ])
+    ], cwd=cwd)
     return out
 
 
@@ -239,10 +253,10 @@ def main() -> int:
     ap.add_argument("--offline-narration", action="store_true",
                     help="use silent placeholder audio from timings (no ttsd)")
     ap.add_argument("--music", default=None, help="music file (else recipe.music_track in music_library/)")
-    ap.add_argument("--render-runtime", choices=["ffmpeg", "remotion"], default="ffmpeg",
-                    help="ffmpeg: self-contained assembly (default). remotion: render the "
-                         "Explainer screencast_scene (animated callouts/zoom) — needs "
-                         "remotion-composer/node_modules.")
+    ap.add_argument("--render-runtime", choices=["ffmpeg", "remotion"], default=None,
+                    help="ffmpeg: self-contained assembly. remotion: render the Explainer "
+                         "screencast_scene (animated callouts/zoom) — needs remotion-composer/"
+                         "node_modules. Default: recipe.render_runtime, else ffmpeg.")
     ap.add_argument("--intro-seconds", type=float, default=3.0)
     ap.add_argument("--outro-seconds", type=float, default=3.0)
     ap.add_argument("--capture", default=None,
@@ -256,6 +270,12 @@ def main() -> int:
     recipe = tut["recipe"]
     lang = recipe.get("lang", "en")
     target = (1920, 1080)
+    # Runtime: explicit CLI wins, else the recipe can pin it (so the same tutorial
+    # renders identically locally and on the cluster), else ffmpeg.
+    runtime = args.render_runtime or recipe.get("render_runtime") or "ffmpeg"
+    if runtime not in ("ffmpeg", "remotion"):
+        print(f"ERROR: invalid render_runtime {runtime!r} (from recipe/CLI)", file=sys.stderr)
+        return 2
 
     project_dir = init_project(
         args.project_id,
@@ -268,7 +288,12 @@ def main() -> int:
 
     # 1) Capture (or reuse a provided raw capture for testing).
     if args.capture:
-        manifest = json.loads(Path(args.manifest).read_text()) if args.manifest else tut["timings"]
+        if not args.manifest:
+            print("ERROR: --capture requires --manifest. Step timings, regions and drift "
+                  "markers come from the capture manifest; timings.json alone places every "
+                  "step at t=0.", file=sys.stderr)
+            return 2
+        manifest = json.loads(Path(args.manifest).read_text())
         raw_video = args.capture
     else:
         manifest = bridge.run_tutorial_spec(str(client_dir), tut["spec_rel"], base_url=args.base_url)
@@ -291,10 +316,16 @@ def main() -> int:
         if 0 <= i < len(durations_ms):
             durations_ms[i] = int(ts.get("duration_ms", 0))
 
-    # 4) Narration.
-    if args.offline_narration or not durations_ms or all(d == 0 for d in durations_ms):
+    # 4) Narration. Only go silent when EXPLICITLY offline — otherwise synthesize
+    #    via ttsd (HttpNarrator needs no pre-existing durations), so a missing
+    #    timings.json never silently ships a silent "successful" video.
+    if args.offline_narration:
         narrator = OfflineNarrator(durations_ms if any(durations_ms) else [1500] * len(steps))
     else:
+        if not any(durations_ms):
+            print("WARN: no committed timings.json for this tutorial — the capture was not "
+                  "paced to the narration. Synthesizing fresh via ttsd; run author_tutorial.py "
+                  "to commit timings and re-capture for correct pacing.", file=sys.stderr)
         narrator = HttpNarrator(args.narration_url)
 
     clips: list[tuple[float, Path]] = []
@@ -317,40 +348,50 @@ def main() -> int:
     music_path = _resolve_music(args.music, recipe)
     final = project_dir / "renders" / "final.mp4"
     final.parent.mkdir(parents=True, exist_ok=True)
+    artifacts = project_dir / "artifacts"
+    artifacts.mkdir(parents=True, exist_ok=True)
 
-    # 5) Full-timeline narration track + Remotion props. Emitted for both runtimes:
-    #    the remotion runtime renders straight from these, and they document the v2
-    #    screencast scene (animated callouts/zoom) for the ffmpeg runtime too.
-    full_audio = build_full_audio(assets, clips, args.intro_seconds, body_duration,
-                                  args.outro_seconds, music_path)
-    props = T.build_remotion_props(
-        steps, str(capture_mp4), body_duration, recipe,
-        intro_s=args.intro_seconds, outro_s=args.outro_seconds,
-        narration_audio_path=str(full_audio), music_path=None,
-    )
-    props_path = project_dir / "artifacts" / "remotion_props.json"
-    props_path.parent.mkdir(parents=True, exist_ok=True)
-    props_path.write_text(json.dumps(props, indent=2))
-
-    # 6) Render via the chosen runtime.
-    if args.render_runtime == "remotion":
-        _run_remotion(props_path, final)
+    # 5) Render via the chosen runtime. Build ONLY the audio that runtime needs
+    #    (no double mix) and emit props/edit_decisions that match what shipped.
+    srt_path: Optional[Path] = None
+    if runtime == "remotion":
+        # One full-timeline narration+music track drives the Remotion <Audio>.
+        body_audio = build_full_audio(assets, clips, args.intro_seconds, body_duration,
+                                      args.outro_seconds, music_path)
+        props = T.build_remotion_props(
+            steps, str(capture_mp4), body_duration, recipe,
+            intro_s=args.intro_seconds, outro_s=args.outro_seconds,
+            narration_audio_path=str(body_audio), music_path=None,
+        )
+        (artifacts / "remotion_props.json").write_text(json.dumps(props, indent=2))
+        _run_remotion(artifacts / "remotion_props.json", final)
     else:
-        render_ffmpeg_assembly(project_dir, assets, capture_mp4, steps, clips,
-                               body_duration, recipe, music_path,
-                               args.intro_seconds, args.outro_seconds, final, target)
+        body_audio, srt_path = render_ffmpeg_assembly(
+            project_dir, assets, capture_mp4, steps, clips, body_duration, recipe,
+            music_path, args.intro_seconds, args.outro_seconds, final, target)
+        # Reference props for re-rendering via Remotion (the mp4 carries its own audio).
+        props = T.build_remotion_props(
+            steps, str(capture_mp4), body_duration, recipe,
+            intro_s=args.intro_seconds, outro_s=args.outro_seconds,
+            narration_audio_path=None, music_path=None,
+        )
+        (artifacts / "remotion_props.json").write_text(json.dumps(props, indent=2))
 
-    # 7) Persist edit_decisions (render_runtime reflects the chosen path).
+    # 6) edit_decisions + a best-effort completed `compose` checkpoint so the
+    #    Backlot board reflects the run that actually produced final.mp4.
     ed = T.build_edit_decisions(
         steps, str(capture_mp4), body_duration,
         intro_s=args.intro_seconds, outro_s=args.outro_seconds, recipe=recipe,
-        narration_audio_path=str(full_audio),
+        narration_audio_path=str(body_audio),
+        subtitles_path=str(srt_path) if srt_path else None,
         music_path=str(music_path) if music_path else None,
-        render_runtime=args.render_runtime,
+        render_runtime=runtime,
     )
-    (project_dir / "artifacts" / "edit_decisions.json").write_text(json.dumps(ed, indent=2))
+    (artifacts / "edit_decisions.json").write_text(json.dumps(ed, indent=2))
+    _record_checkpoint(args.project_id, str(final),
+                       args.intro_seconds + body_duration + args.outro_seconds, runtime, target)
 
-    print(f"OK final render ({args.render_runtime}): {final}")
+    print(f"OK final render ({runtime}): {final}")
     return 0
 
 
@@ -371,8 +412,9 @@ def build_full_audio(assets: Path, clips, intro_s: float, body_duration: float,
 def render_ffmpeg_assembly(project_dir: Path, assets: Path, capture_mp4: Path, steps, clips,
                            body_duration: float, recipe: dict, music_path: Optional[Path],
                            intro_s: float, outro_s: float, final: Path,
-                           target: tuple) -> Path:
-    """v1 self-contained ffmpeg render: narrated+captioned body between title cards."""
+                           target: tuple) -> tuple[Path, Optional[Path]]:
+    """v1 self-contained ffmpeg render: narrated+captioned body between title cards.
+    Returns (body_audio_path, srt_path) for the edit_decisions record."""
     narr = narration_bed(clips, body_duration, assets / "audio" / "narration.wav")
     if music_path:
         bed = loop_music(music_path, body_duration, assets / "music" / "music_bed_body.wav")
@@ -391,7 +433,35 @@ def render_ffmpeg_assembly(project_dir: Path, assets: Path, capture_mp4: Path, s
     body_final = burn_and_mux(capture_mp4, Path(body_audio), srt,
                               assets / "video" / "body_final.mp4", target, recipe)
     concat_av([intro_mp4, body_final, outro_mp4], final)
-    return final
+    return Path(body_audio), srt
+
+
+def _record_checkpoint(project_id: str, final_path: str, duration_s: float,
+                       runtime: str, target: tuple) -> None:
+    """Best-effort completed `compose` checkpoint (an ungated stage) so the Backlot
+    board shows the run that produced final.mp4. Writes the stage's canonical
+    render_report artifact (schema-validated). Non-fatal — the render succeeded."""
+    try:
+        from lib.checkpoint import write_checkpoint
+
+        render_report = {
+            "version": "1.0",
+            "outputs": [{
+                "path": final_path,
+                "format": "mp4",
+                "resolution": f"{target[0]}x{target[1]}",
+                "duration_seconds": round(duration_s, 3),
+            }],
+        }
+        write_checkpoint(
+            PROJECTS_DIR, project_id, "compose", "completed",
+            {"render_report": render_report},
+            pipeline_type="screen-demo",
+            metadata={"origin": "cypress-tutorial", "render_runtime": runtime,
+                      "note": "deterministic render_tutorial executor (not the agent pipeline)"},
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"WARN could not write compose checkpoint: {e}", file=sys.stderr)
 
 
 def _run_remotion(props_path: Path, out: Path) -> Path:
@@ -411,14 +481,17 @@ def _run_remotion(props_path: Path, out: Path) -> Path:
 
 
 def _resolve_music(cli_music: Optional[str], recipe: dict) -> Optional[Path]:
-    if cli_music:
-        p = Path(cli_music)
-        return p if p.exists() else None
-    track = recipe.get("music_track")
+    """Resolve --music or recipe.music_track against a literal path first, then
+    music_library/. Warns (never silently drops) when a requested track is missing."""
+    track = cli_music or recipe.get("music_track")
     if not track:
         return None
-    p = REPO_ROOT / "music_library" / track
-    return p if p.exists() else None
+    for cand in (Path(track), REPO_ROOT / "music_library" / track):
+        if cand.exists():
+            return cand
+    print(f"WARN: music '{track}' not found (checked as a path and in music_library/) — "
+          "rendering without music.", file=sys.stderr)
+    return None
 
 
 def _build_srt(steps, project_dir: Path) -> Optional[Path]:

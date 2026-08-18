@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 import uuid
 from datetime import timedelta
 from typing import Optional
@@ -36,8 +37,14 @@ SECRET_TTSD_NAME = os.environ.get("SECRET_TTSD_NAME", "ttsd-secret")
 SECRET_MINIO_NAME = os.environ.get("SECRET_MINIO_NAME", "minio-secret")
 RESULT_BUCKET = os.environ.get("RESULT_BUCKET", "tutorials")
 SERVICE_ACCOUNT = os.environ.get("SERVICE_ACCOUNT", "render-api")
+# The render Job runs arbitrary client Cypress specs + npm — it must NOT carry the
+# API's job-managing token. Give it a token-less SA with no k8s API rights.
+WORKER_SERVICE_ACCOUNT = os.environ.get("WORKER_SERVICE_ACCOUNT", "render-worker")
 MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", "2"))
-JOB_TTL = int(os.environ.get("JOB_TTL_SECONDS", "3600"))
+# TTL must outlive the presigned download URL, else GET /renders/{id} 404s while
+# the object still exists in MinIO.
+PRESIGN_HOURS = int(os.environ.get("PRESIGN_HOURS", "24"))
+JOB_TTL = int(os.environ.get("JOB_TTL_SECONDS", str((PRESIGN_HOURS + 1) * 3600)))
 JOB_DEADLINE = int(os.environ.get("JOB_DEADLINE_SECONDS", "1800"))
 WORKER_MEM_REQUEST = os.environ.get("WORKER_MEM_REQUEST", "4Gi")
 WORKER_MEM_LIMIT = os.environ.get("WORKER_MEM_LIMIT", "8Gi")
@@ -48,6 +55,9 @@ RENDER_RUNTIME = os.environ.get("RENDER_RUNTIME", "remotion")
 
 LABEL_APP = "tutorial-render"
 _SLUG = re.compile(r"[^a-z0-9-]+")
+# Serialize the capacity check + Job creation. Sync endpoints run in uvicorn's
+# threadpool, so without this two concurrent POSTs can both pass the check.
+_create_lock = threading.Lock()
 
 app = FastAPI(title="Tutorial Render API")
 
@@ -160,7 +170,10 @@ def _build_job(render_id: str, req: RenderRequest) -> dict:
                 "metadata": {"labels": labels},
                 "spec": {
                     "restartPolicy": "Never",
-                    "serviceAccountName": SERVICE_ACCOUNT,
+                    # Token-less SA: the worker runs untrusted client JS/npm and
+                    # must not be able to reach the k8s API or read the token.
+                    "serviceAccountName": WORKER_SERVICE_ACCOUNT,
+                    "automountServiceAccountToken": False,
                     "volumes": [
                         {"name": "work", "emptyDir": {}},
                         {"name": "clips", "emptyDir": {}},
@@ -180,19 +193,32 @@ def healthz():
 
 @app.post("/renders")
 def create_render(req: RenderRequest):
-    if not req.offline and not req.base_url:
-        raise HTTPException(400, "base_url is required unless offline=true")
+    # base_url is required even when offline=true: `offline` only silences
+    # narration; the worker still captures the app with Cypress and would
+    # otherwise fall back to the config's default (unreachable in-cluster) URL.
+    if not req.base_url:
+        raise HTTPException(400, "base_url is required (the app must be captured, even offline)")
     batch = client.BatchV1Api()
-    if _active_job_count(batch) >= MAX_CONCURRENT:
-        raise HTTPException(429, f"at capacity ({MAX_CONCURRENT} concurrent renders)")
 
     render_id = f"{_slug(req.tutorial)}-{uuid.uuid4().hex[:8]}"
     job = _build_job(render_id, req)
-    try:
-        batch.create_namespaced_job(NAMESPACE, job)
-    except client.exceptions.ApiException as e:
-        raise HTTPException(500, f"failed to create Job: {e.reason}") from e
+    with _create_lock:
+        if _active_job_count(batch) >= MAX_CONCURRENT:
+            raise HTTPException(429, f"at capacity ({MAX_CONCURRENT} concurrent renders)")
+        try:
+            batch.create_namespaced_job(NAMESPACE, job)
+        except client.exceptions.ApiException as e:
+            raise HTTPException(500, f"failed to create Job: {e.reason}") from e
     return {"render_id": render_id, "status": "queued"}
+
+
+def _presign(render_id: str) -> Optional[str]:
+    try:
+        return _minio().presigned_get_object(
+            RESULT_BUCKET, f"{render_id}/final.mp4", expires=timedelta(hours=PRESIGN_HOURS)
+        )
+    except Exception:  # noqa: BLE001
+        return None
 
 
 @app.get("/renders/{render_id}")
@@ -200,7 +226,16 @@ def get_render(render_id: str):
     batch = client.BatchV1Api()
     try:
         job = batch.read_namespaced_job_status(f"render-{render_id}", NAMESPACE)
-    except client.exceptions.ApiException:
+    except client.exceptions.ApiException as e:
+        # Only a genuine 404 means "no such render". Job may have been TTL-reaped
+        # after success — fall back to MinIO. Any other API error is a real fault.
+        if getattr(e, "status", None) != 404:
+            raise HTTPException(502, f"kubernetes error: {e.reason}") from e
+        try:
+            if _minio().stat_object(RESULT_BUCKET, f"{render_id}/final.mp4"):
+                return {"render_id": render_id, "status": "succeeded", "download_url": _presign(render_id)}
+        except Exception:  # noqa: BLE001
+            pass
         raise HTTPException(404, "render not found")
 
     st = job.status
@@ -215,11 +250,9 @@ def get_render(render_id: str):
 
     out = {"render_id": render_id, "status": status}
     if status == "succeeded":
-        try:
-            url = _minio().presigned_get_object(
-                RESULT_BUCKET, f"{render_id}/final.mp4", expires=timedelta(hours=24)
-            )
+        url = _presign(render_id)
+        if url:
             out["download_url"] = url
-        except Exception as e:  # noqa: BLE001
-            out["download_error"] = str(e)
+        else:
+            out["download_error"] = "presign failed"
     return out

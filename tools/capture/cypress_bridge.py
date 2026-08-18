@@ -5,8 +5,6 @@
 - normalize_capture: recover each step's true video time from the drift markers
   (robust to Cypress's variable-FPS screencast by re-encoding to CFR first), then
   crop the marker strip away and letterbox to the target resolution.
-- seed_from_manifest: shape the manifest into the brief/interaction_map/sections
-  fields the screen-demo pipeline expects.
 
 Requires the `ffmpeg`/`ffprobe` binaries (already an OpenMontage dependency).
 """
@@ -87,27 +85,36 @@ def run_tutorial_spec(
 
 
 def _find_manifest(client: Path, spec: str) -> tuple[dict, Path]:
-    """Locate the newest manifest sidecar written for `spec`."""
+    """Locate the newest manifest sidecar written for `spec`.
+
+    Prefers an EXACT `manifest.spec == spec` match (so a prefix-colliding tutorial,
+    e.g. `sales-tour-2` vs `sales-tour`, never wins); only falls back to a name
+    substring when no exact match exists.
+    """
     videos = client / "cypress" / "videos"
     spec_rel = spec.replace("\\", "/")
     spec_name = Path(spec_rel).name
-    best: Optional[tuple[float, Path, dict]] = None
+    exact: list[tuple[float, Path, dict]] = []
+    loose: list[tuple[float, Path, dict]] = []
     if videos.exists():
         for p in videos.rglob("*.manifest.json"):
             try:
                 data = json.loads(p.read_text())
             except Exception:
                 continue
-            if data.get("spec") == spec_rel or spec_name in p.name:
-                mt = p.stat().st_mtime
-                if best is None or mt > best[0]:
-                    best = (mt, p, data)
-    if best is None:
+            mt = p.stat().st_mtime
+            if data.get("spec") == spec_rel:
+                exact.append((mt, p, data))
+            elif spec_name in p.name:
+                loose.append((mt, p, data))
+    pool = exact or loose
+    if not pool:
         raise FileNotFoundError(
             f"No tutorial manifest found for spec {spec!r} under {videos}. "
             "Did the run register the manifest tasks (cypress.tutorial.config.js)?"
         )
-    return best[2], best[1]
+    pool.sort(key=lambda x: x[0])
+    return pool[-1][2], pool[-1][1]
 
 
 # --- normalization: marker detection + crop/pad -----------------------------
@@ -243,40 +250,4 @@ def normalize_capture(
         "marker_times_s": rel_times,
         "body_duration_s": probe(str(out))["duration"],
         "trim_start_s": trim_start,
-    }
-
-
-# --- seeding the pipeline ----------------------------------------------------
-
-def seed_from_manifest(manifest: dict, source_path: str) -> dict:
-    """Shape the manifest into screen-demo brief/interaction_map/sections.
-
-    Lets the pipeline skip the `transcriber` entirely: the interaction map and
-    narration sections come straight from the Cypress steps.
-    """
-    steps = sorted(manifest.get("steps", []), key=lambda s: s.get("index", 0))
-    interaction_map = [
-        {
-            "timestamp_seconds": round(s.get("t_ms", 0) / 1000.0, 3),
-            "action_type": s.get("action", "note"),
-            "target": s.get("target"),
-            "importance": s.get("importance", "normal"),
-            "suggested_treatment": s.get("suggested_treatment", "realtime"),
-        }
-        for s in steps
-    ]
-    sections = [
-        {"id": f"step_{s.get('index', i)}", "narration": (s.get("narration") or "").strip()}
-        for i, s in enumerate(steps)
-    ]
-    return {
-        "brief_metadata": {
-            "source_path": source_path,
-            "production_mode": "real_capture",
-            "has_voiceover": "silent",
-            "software_shown": "Circuit Auction Backoffice",
-            "demo_archetype": "tutorial",
-        },
-        "interaction_map": interaction_map,
-        "sections": sections,
     }

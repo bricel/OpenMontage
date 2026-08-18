@@ -4,5 +4,7 @@
   "client_dir": "../circuitauction-backoffice/client",
   "render_runtime": "ffmpeg",
   "projects_dir": "",
-  "lang": "en"
+  "lang": "en",
+  "ttsd_image": "circuit-ttsd:local",
+  "narration_repo": "../circuit-bid/redis-bridge"
 }

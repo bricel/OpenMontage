@@ -13,10 +13,17 @@ set -euo pipefail
 CLIENT_DIR="${CLIENT_DIR:-/app/client}"
 
 if [ -n "${CLIENT_REF:-}" ]; then
-  echo "[worker] updating client checkout to ref ${CLIENT_REF}"
-  git -C "$CLIENT_DIR" fetch origin "${CLIENT_REF}" || git -C "$CLIENT_DIR" fetch origin
-  git -C "$CLIENT_DIR" checkout -f "${CLIENT_REF}"
-  (cd "$CLIENT_DIR" && npm ci --prefer-offline >/dev/null 2>&1 || true)
+  if [ -d "$CLIENT_DIR/.git" ]; then
+    echo "[worker] updating client checkout to ref ${CLIENT_REF}"
+    # Check out the FETCHED commit (FETCH_HEAD), not a stale baked-in local branch.
+    git -C "$CLIENT_DIR" fetch --depth 1 origin "${CLIENT_REF}"
+    git -C "$CLIENT_DIR" checkout -f FETCH_HEAD
+    (cd "$CLIENT_DIR" && npm ci --prefer-offline >/dev/null 2>&1 || true)
+  else
+    # The image bakes a repo subdirectory with no .git; don't abort the render —
+    # fall back to the baked specs. (Build with a real git checkout for ref support.)
+    echo "[worker] CLIENT_REF set but $CLIENT_DIR has no .git — using baked specs" >&2
+  fi
 fi
 
 wait_for_ttsd() {
@@ -34,6 +41,7 @@ if [ -n "${TUTORIAL:-}" ]; then
   wait_for_ttsd
   ARGS=(--tutorial "$TUTORIAL" --project-id "$PROJECT_ID" --client-dir "$CLIENT_DIR")
   ARGS+=(--render-runtime "${RENDER_RUNTIME:-remotion}")
+  [ -n "${NARRATION_URL:-}" ] && ARGS+=(--narration-url "$NARRATION_URL")
   [ -n "${BASE_URL:-}" ] && ARGS+=(--base-url "$BASE_URL")
   [ "${OFFLINE:-0}" = "1" ] && ARGS+=(--offline-narration)
   [ -n "${MUSIC:-}" ] && ARGS+=(--music "$MUSIC")

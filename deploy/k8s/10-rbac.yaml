@@ -4,6 +4,16 @@ metadata:
   name: render-api
   namespace: tutorial-render
 ---
+# Token-less SA for the render Job pods. They run untrusted client Cypress specs
+# + npm and must have NO k8s API rights (no Role bound to this SA). The Job also
+# sets automountServiceAccountToken:false.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: render-worker
+  namespace: tutorial-render
+automountServiceAccountToken: false
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:

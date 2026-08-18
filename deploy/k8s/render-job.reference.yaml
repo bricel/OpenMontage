@@ -24,7 +24,8 @@ spec:
         render-id: sales-tour-manual
     spec:
       restartPolicy: Never
-      serviceAccountName: render-api
+      serviceAccountName: render-worker   # token-less; no k8s API rights
+      automountServiceAccountToken: false
       volumes:
         - name: work
           emptyDir: {}

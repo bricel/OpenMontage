@@ -14,6 +14,11 @@ from pathlib import Path
 from typing import Any, Optional
 
 
+# Base music level before ducking — kept in one place so render_tutorial's
+# loop_music and the edit_decisions/props records agree.
+MUSIC_VOLUME = 0.22
+
+
 @dataclass
 class Step:
     """One narratable beat, recorded by cy.tutorialStep into the manifest."""
@@ -204,12 +209,15 @@ def build_edit_decisions(
         audio["music"] = {
             "asset_id": "music",
             "src": music_path,
-            "volume": 0.18,
+            "volume": MUSIC_VOLUME,
             "fade_in_seconds": 1.0,
             "fade_out_seconds": 1.5,
             "ducking": True,
         }
 
+    # subtitles.enabled reflects reality: the ffmpeg runtime burns an SRT (source
+    # set); the remotion runtime renders word captions instead (no SRT track).
+    subtitles_enabled = subtitles_path is not None
     return {
         "version": "1.0",
         "renderer_family": "screen-demo",
@@ -219,7 +227,7 @@ def build_edit_decisions(
         "overlays": overlays,
         "audio": audio,
         "subtitles": {
-            "enabled": True,
+            "enabled": subtitles_enabled,
             "style": recipe.get("subtitle_style", "word_by_word"),
             "source": subtitles_path or "",
             "position": "bottom-center",
@@ -359,7 +367,7 @@ def build_remotion_props(
         audio["narration"] = {"src": narration_audio_path, "volume": 1.0}
     if music_path:
         audio["music"] = {
-            "src": music_path, "volume": 0.18,
+            "src": music_path, "volume": MUSIC_VOLUME,
             "fadeInSeconds": 1.0, "fadeOutSeconds": 1.5,
         }
     if audio:

@@ -6,14 +6,22 @@ just configure its address. tutorialctl ties together the pieces so you can go
 from "is my environment ready?" to a rendered tutorial in a couple of commands.
 
   tutorialctl init                 # write tutorial.config.json you can edit
+  tutorialctl up                   # start the ttsd narration container locally
   tutorialctl doctor               # verify the env (ffmpeg, ttsd, demo app, node, specs)
   tutorialctl list                 # list available tutorials
   tutorialctl author <name>        # generate <name>.timings.json via ttsd
   tutorialctl render <name>        # capture + render a tutorial video
   tutorialctl run <name>           # author + render in one shot
+  tutorialctl down                 # stop/remove the ttsd container
 
-Config precedence: CLI flags > env (TUTORIAL_*) > config file > defaults.
-Keys: narration_url, base_url, client_dir, render_runtime, projects_dir, lang.
+The narration service (ttsd, from circuit-bid/redis-bridge) reuses the ElevenLabs
+narration core over HTTP. `up` builds+runs it locally, forwarding ELEVENLABS_API_KEY
+/ ELEVENLABS_VOICE_IDS from your shell. (It needs no Redis — that's only for the
+live-stream narrator, which tutorials don't use.)
+
+Config precedence: CLI flags > env (TUTORIAL_*) > config file > defaults. Keys:
+narration_url, base_url, client_dir, render_runtime, projects_dir, lang, ttsd_image,
+narration_repo, env_file. `up` reads ELEVENLABS_* from your shell or env_file.
 """
 
 from __future__ import annotations
@@ -21,12 +29,17 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 REPO_ROOT = Path(__file__).resolve().parent
+TTSD_CONTAINER = "tutorial-ttsd"
+TTSD_CLIPS_VOLUME = "tutorial-ttsd-clips"
 
 DEFAULTS = {
     "narration_url": "http://127.0.0.1:5557",
@@ -35,6 +48,9 @@ DEFAULTS = {
     "render_runtime": "ffmpeg",
     "projects_dir": "",  # blank -> OpenMontage default (repo/projects)
     "lang": "en",
+    "ttsd_image": "circuit-ttsd:local",
+    "narration_repo": str(REPO_ROOT.parent / "circuit-bid" / "redis-bridge"),
+    "env_file": "",  # blank -> OpenMontage/.env; source of ELEVENLABS_* for `up`
 }
 ENV_MAP = {
     "narration_url": "TUTORIAL_NARRATION_URL",
@@ -43,7 +59,11 @@ ENV_MAP = {
     "render_runtime": "TUTORIAL_RENDER_RUNTIME",
     "projects_dir": "TUTORIAL_PROJECTS_DIR",
     "lang": "TUTORIAL_LANG",
+    "ttsd_image": "TUTORIAL_TTSD_IMAGE",
+    "narration_repo": "TUTORIAL_NARRATION_REPO",
+    "env_file": "TUTORIAL_ENV_FILE",
 }
+NARRATION_KEYS = ("ELEVENLABS_API_KEY", "ELEVENLABS_VOICE_IDS", "ELEVENLABS_MODEL_ID")
 
 GREEN, RED, YELLOW, DIM, RESET = "\033[32m", "\033[31m", "\033[33m", "\033[2m", "\033[0m"
 if not sys.stdout.isatty():
@@ -173,6 +193,8 @@ def cmd_doctor(args, cfg) -> int:
     fails = [c for c in checks if c[1] == "fail"]
     warns = [c for c in checks if c[1] == "warn"]
     print()
+    if any(c[0] == "ttsd narration" and c[1] == "fail" for c in checks):
+        print(f"{DIM}hint: run `tutorialctl up` to start the ttsd narration container locally.{RESET}")
     if fails:
         print(f"{RED}{len(fails)} blocking issue(s).{RESET} Fix these before rendering.")
         return 1
@@ -191,6 +213,177 @@ def cmd_list(args, cfg) -> int:
         recipe = "recipe" if spec.with_name(f"{name}.tutorial.json").exists() else f"{YELLOW}no-recipe{RESET}"
         timings = "timings" if spec.with_name(f"{name}.timings.json").exists() else f"{DIM}no-timings{RESET}"
         print(f"  {name:<24} {DIM}{recipe} - {timings}{RESET}")
+    return 0
+
+
+def _parse_env_file(path: Path) -> dict:
+    """Minimal .env parser (KEY=VALUE), tolerant of `export`, quotes, comments."""
+    out: dict[str, str] = {}
+    try:
+        for raw in path.read_text().splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):]
+            key, _, val = line.partition("=")
+            key = key.strip()
+            val = val.strip().strip('"').strip("'")
+            if key:
+                out[key] = val
+    except OSError:
+        pass
+    return out
+
+
+def _clean_value(key: str, val: str) -> str:
+    """Resolve a self-referential shell default for `key`, e.g.
+    `${ELEVENLABS_MODEL_ID:-eleven_multilingual_v2}` (or the mangled brace-less
+    `ELEVENLABS_MODEL_ID:-eleven_multilingual_v2`) -> the real env value or the
+    default. Only matches when the template references `key` itself, so real data
+    containing ':' (like `en:VID,fr:VID`) is never altered."""
+    m = re.fullmatch(r"\$?\{?" + re.escape(key) + r"(?::-?(.*?))?\}?", val)
+    if m:
+        return os.environ.get(key) or (m.group(1) or "")
+    return val
+
+
+def _narration_env(cfg: dict) -> tuple[dict, str | None]:
+    """Resolve ELEVENLABS_* for the ttsd container: shell env wins, then the
+    configured .env file (default OpenMontage/.env)."""
+    env_file = Path(cfg.get("env_file") or (REPO_ROOT / ".env"))
+    file_vals = _parse_env_file(env_file) if env_file.exists() else {}
+    vals = {}
+    for k in NARRATION_KEYS:
+        raw = os.environ.get(k) or file_vals.get(k)
+        if raw:
+            v = _clean_value(k, raw)
+            if v:
+                vals[k] = v
+    return vals, (str(env_file) if env_file.exists() else None)
+
+
+def _mask(argv: list[str]) -> str:
+    """Redact secret values (KEY=..., SECRET=..., TOKEN=...) for display."""
+    shown = []
+    for a in argv:
+        if "=" in a and any(s in a.split("=", 1)[0].upper() for s in ("KEY", "SECRET", "TOKEN", "PASSWORD")):
+            shown.append(a.split("=", 1)[0] + "=***")
+        else:
+            shown.append(a)
+    return " ".join(shown)
+
+
+def _docker_state(name: str) -> str:
+    """'running' | 'stopped' | 'absent' for a container."""
+    r = subprocess.run(["docker", "inspect", "-f", "{{.State.Running}}", name],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return "absent"
+    return "running" if r.stdout.strip() == "true" else "stopped"
+
+
+def _wait_health(url: str, tries: int = 25) -> bool:
+    try:
+        import requests
+    except Exception:  # noqa: BLE001
+        return False
+    base = url.rstrip("/")
+    for _ in range(tries):
+        try:
+            r = requests.get(f"{base}/health", timeout=3)
+            if r.status_code == 200:
+                langs = ",".join(r.json().get("languages", [])) or "none configured"
+                print(f"{GREEN}ttsd healthy{RESET} {DIM}({url}) — voices: {langs}{RESET}")
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(1)
+    print(f"{YELLOW}ttsd not healthy yet{RESET} at {url} — check `docker logs {TTSD_CONTAINER}`")
+    return False
+
+
+def cmd_up(args, cfg) -> int:
+    if not shutil.which("docker"):
+        print(f"{RED}docker not found on PATH{RESET}")
+        return 1
+    dry = getattr(args, "dry_run", False)
+    port = urlparse(cfg["narration_url"]).port or 5557
+    image = cfg["ttsd_image"]
+
+    def sh(argv, capture=False):
+        print(f"{DIM}+ {' '.join(argv)}{RESET}")
+        if dry:
+            return 0
+        r = subprocess.run(argv, capture_output=True, text=True) if capture else subprocess.run(argv)
+        return r.returncode
+
+    # Build the image if requested or missing.
+    have = subprocess.run(["docker", "image", "inspect", image],
+                          capture_output=True, text=True).returncode == 0
+    if getattr(args, "build", False) or (not have and not dry):
+        dockerfile = Path(cfg["narration_repo"]) / "Dockerfile.ttsd"
+        if not dockerfile.exists():
+            print(f"{RED}cannot build:{RESET} {dockerfile} not found. "
+                  f"Set narration_repo, or pre-pull ttsd_image ({image}).")
+            return 1
+        if sh(["docker", "build", "-f", str(dockerfile), "-t", image, str(cfg["narration_repo"])]) != 0:
+            return 1
+
+    # Narration keys: shell env wins, else the .env file (default OpenMontage/.env).
+    nenv, env_src = _narration_env(cfg)
+    have_synth = bool(nenv.get("ELEVENLABS_API_KEY") and nenv.get("ELEVENLABS_VOICE_IDS"))
+
+    # Start / create the container (idempotent). --recreate removes it first so a
+    # changed key/env actually takes effect (docker bakes env at run time).
+    state = "absent" if dry else _docker_state(TTSD_CONTAINER)
+    if getattr(args, "recreate", False) and state != "absent":
+        sh(["docker", "rm", "-f", TTSD_CONTAINER])
+        state = "absent"
+
+    if state == "running":
+        print(f"{YELLOW}{TTSD_CONTAINER} already running{RESET} "
+              f"{DIM}(run `up --recreate` to apply changed keys/env){RESET}")
+    elif state == "stopped":
+        if sh(["docker", "start", TTSD_CONTAINER]) != 0:
+            return 1
+        print(f"{GREEN}started{RESET} existing {TTSD_CONTAINER}")
+    else:
+        run_argv = ["docker", "run", "-d", "--name", TTSD_CONTAINER,
+                    "-p", f"127.0.0.1:{port}:5557"]
+        for k, v in nenv.items():
+            run_argv += ["-e", f"{k}={v}"]
+        run_argv += ["-v", f"{TTSD_CLIPS_VOLUME}:/clips", image]
+        print(f"{DIM}+ {_mask(run_argv)}{RESET}")
+        if not dry and subprocess.run(run_argv).returncode != 0:
+            return 1
+        print(f"{GREEN}started{RESET} {TTSD_CONTAINER} on 127.0.0.1:{port}")
+
+    if have_synth:
+        print(f"{GREEN}synthesis enabled{RESET} {DIM}(ELEVENLABS_* "
+              f"{'from ' + env_src if env_src and not os.environ.get('ELEVENLABS_API_KEY') else 'from shell'}){RESET}")
+    else:
+        where = f"{env_src} or your shell" if env_src else "your shell or OpenMontage/.env"
+        print(f"{YELLOW}note:{RESET} ELEVENLABS_API_KEY / ELEVENLABS_VOICE_IDS not found ({where}) — "
+              f"ttsd will only serve cached clips.")
+    if not dry:
+        _wait_health(cfg["narration_url"])
+    return 0
+
+
+def cmd_down(args, cfg) -> int:
+    if not shutil.which("docker"):
+        print(f"{RED}docker not found on PATH{RESET}")
+        return 1
+    argv = ["docker", "rm", "-f", TTSD_CONTAINER]
+    print(f"{DIM}+ {' '.join(argv)}{RESET}")
+    if getattr(args, "dry_run", False):
+        return 0
+    r = subprocess.run(argv, capture_output=True, text=True)
+    if r.returncode == 0:
+        print(f"{GREEN}removed{RESET} {TTSD_CONTAINER}")
+    else:
+        print(f"{YELLOW}{(r.stderr or 'nothing to remove').strip()}{RESET}")
     return 0
 
 
@@ -229,7 +422,9 @@ def cmd_render(args, cfg) -> int:
 
 
 def cmd_run(args, cfg) -> int:
-    if not args.capture:  # a --capture render supplies its own manifest; skip authoring
+    # Skip authoring when offline (author needs ttsd) or when a --capture render
+    # supplies its own manifest.
+    if not args.capture and not args.offline:
         rc = cmd_author(args, cfg)
         if rc != 0:
             return rc
@@ -251,6 +446,11 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--render-runtime", dest="render_runtime", default=S, choices=["ffmpeg", "remotion"])
     common.add_argument("--projects-dir", dest="projects_dir", default=S, help="OPENMONTAGE_PROJECTS_DIR override")
     common.add_argument("--lang", dest="lang", default=S, help="narration language code")
+    common.add_argument("--ttsd-image", dest="ttsd_image", default=S, help="ttsd docker image (for `up`)")
+    common.add_argument("--narration-repo", dest="narration_repo", default=S,
+                        help="circuit-bid/redis-bridge path (to build ttsd)")
+    common.add_argument("--env-file", dest="env_file", default=S,
+                        help="path to .env with ELEVENLABS_* (default OpenMontage/.env)")
     common.add_argument("--dry-run", action="store_true", default=S, help="print commands without running them")
 
     p = argparse.ArgumentParser(prog="tutorialctl", description=__doc__, parents=[common],
@@ -260,6 +460,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("init", parents=[common], help="write a config file")
     sp.add_argument("--force", action="store_true")
     sp.set_defaults(func=cmd_init)
+
+    sp = sub.add_parser("up", parents=[common], help="start the ttsd narration container locally")
+    sp.add_argument("--build", action="store_true", help="build the ttsd image first")
+    sp.add_argument("--recreate", action="store_true", help="remove + recreate to apply changed keys/env")
+    sp.set_defaults(func=cmd_up)
+    sub.add_parser("down", parents=[common], help="stop/remove the ttsd container").set_defaults(func=cmd_down)
 
     sub.add_parser("doctor", parents=[common], help="verify the environment").set_defaults(func=cmd_doctor)
     sub.add_parser("list", parents=[common], help="list tutorials").set_defaults(func=cmd_list)
