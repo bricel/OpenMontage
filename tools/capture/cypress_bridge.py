@@ -78,7 +78,16 @@ def run_tutorial_spec(
     env_pairs: list[str] = []
     if collect_only:
         env_pairs.append("tutorialCollectOnly=1")
-    for key in ("TEST_SALE_ID", "TEST_ITEM_ID", "TEST_CLIENT_ID", "TEST_UID"):
+    for key in (
+        "TEST_SALE_ID",
+        "TEST_ITEM_ID",
+        "TEST_CLIENT_ID",
+        "TEST_CONSIGNMENT_ID",
+        "TEST_ORDER_ID",
+        "TEST_STATEMENT_ID",
+        "TEST_UID",
+        "BACKEND_URL",
+    ):
         val = os.environ.get(f"CYPRESS_{key}") or os.environ.get(key)
         if val:
             env_pairs.append(f"{key}={val}")
