@@ -5,6 +5,9 @@ description: Turn a Cypress spec into a polished tutorial video of a real web ap
 
 # Cypress → tutorial video
 
+To **run** an already-authored Circuit tutorial (demo URL in, MP4 + S3 URL out)
+use the `circuit-video` skill / MCP. This skill is the **author** path.
+
 Author the walkthrough as a Cypress `*.tutorial.cy.js` spec; the pipeline records
 it cleanly, narrates it, captions it, and assembles a finished MP4. Two phases:
 
